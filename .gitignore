@@ -1,0 +1,24 @@
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+*.so
+
+.venv/
+.venv*/
+venv/
+.python-version.bak
+
+# Local runtime artifacts
+data/browser_profile/
+data/session.json
+data/proxies.json
+logs/
+*.log
+*.png
+
+# Accidentally committed virtualenvs / site-packages
+meet/
+meet312/

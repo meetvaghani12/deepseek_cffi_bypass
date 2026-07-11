@@ -1,0 +1,1 @@
+{"algorithm": "DeepSeekHashV1", "challenge": "ebd928d28d2706c92b1e40de8d2b12fe96c68947c9c50e6c34060b9f4a472e34", "salt": "32e34300b01e05ae8f54", "signature": "a253ebc835d310cfcea80567b941350f367c09fc1f0f5b0fd32497dabd67ef9b", "difficulty": 144000, "expire_at": 1783791951338, "expire_after": 300000, "target_path": "/api/v0/chat/completion"}

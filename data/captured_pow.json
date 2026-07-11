@@ -1,0 +1,11 @@
+{
+  "pow": {
+    "algorithm": "DeepSeekHashV1",
+    "challenge": "5d68a553df06e1215da91108b97511cced2857e06369ad108b418d9a50de2c7b",
+    "salt": "56e3d16ca0f1db152ef3",
+    "answer": 53328,
+    "signature": "042d659a178395fcd248459e9fa241a482bdb228fb74f5b961593122f22d01b5",
+    "target_path": "/api/v0/chat/completion"
+  },
+  "raw": "eyJhbGdvcml0aG0iOiJEZWVwU2Vla0hhc2hWMSIsImNoYWxsZW5nZSI6IjVkNjhhNTUzZGYwNmUxMjE1ZGE5MTEwOGI5NzUxMWNjZWQyODU3ZTA2MzY5YWQxMDhiNDE4ZDlhNTBkZTJjN2IiLCJzYWx0IjoiNTZlM2QxNmNhMGYxZGIxNTJlZjMiLCJhbnN3ZXIiOjUzMzI4LCJzaWduYXR1cmUiOiIwNDJkNjU5YTE3ODM5NWZjZDI0ODQ1OWU5ZmEyNDFhNDgyYmRiMjI4ZmI3NGY1Yjk2MTU5MzEyMmYyMmQwMWI1IiwidGFyZ2V0X3BhdGgiOiIvYXBpL3YwL2NoYXQvY29tcGxldGlvbiJ9"
+}
