@@ -163,20 +163,46 @@ class ResponseCache:
 
 _response_cache = ResponseCache()
 
+# Track message count per opencode session to detect new sessions
+_msg_counter = 0
+_last_msg_count = 0
+
+
+def detect_new_session(messages):
+    """Detect if opencode started a new session by checking message count."""
+    global _msg_counter, _last_msg_count
+    current_count = len(messages)
+    if current_count < _last_msg_count:
+        logger.info("NEW SESSION detected (msgs: %d -> %d)", _last_msg_count, current_count)
+        return True
+    _last_msg_count = current_count
+    return False
+
 # ============================================================
 # 3. CLIENT MANAGER — connection pooling + direct HTTP
 # ============================================================
 
 _client = None
 _client_lock = threading.Lock()
+_session_counter = 0
+_session_lock = threading.Lock()
 
 
-def get_client():
-    global _client
+def get_client(reset=False):
+    """Get or create DeepSeek client. reset=True creates new chat session."""
+    global _client, _session_counter
     with _client_lock:
         if _client is None:
             from src.api.client import DeepSeekClient
             _client = DeepSeekClient()
+            logger.info("DeepSeek client created")
+        if reset:
+            # Reset session tracking — next chat() will create new DeepSeek session
+            _client._session_id = None
+            _client._parent_message_id = None
+            with _session_lock:
+                _session_counter += 1
+            logger.info("Session reset (counter=%d)", _session_counter)
         return _client
 
 
@@ -411,32 +437,36 @@ def chat_completions():
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
+    # Detect new opencode session → create new DeepSeek session
+    new_session = detect_new_session(messages)
+
     # Check if last message is a tool result
     last_msg = messages[-1] if messages else {}
     if last_msg.get("role") == "tool":
         return _handle_tool_result(messages, chat_id, created, model, stream)
 
-    # Check response cache
-    cached = _response_cache.get(messages, tools)
-    if cached:
-        logger.info("CACHE HIT")
-        if stream:
-            return Response(
-                stream_text(chat_id, created, model, cached),
-                content_type="text/event-stream", headers=SSE_HEADERS,
-            )
-        return jsonify({
-            "id": chat_id, "object": "chat.completion", "created": created, "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": cached}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        })
+    # Check response cache (skip if new session)
+    if not new_session:
+        cached = _response_cache.get(messages, tools)
+        if cached:
+            logger.info("CACHE HIT")
+            if stream:
+                return Response(
+                    stream_text(chat_id, created, model, cached),
+                    content_type="text/event-stream", headers=SSE_HEADERS,
+                )
+            return jsonify({
+                "id": chat_id, "object": "chat.completion", "created": created, "model": model,
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": cached}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
 
     # Build context
     context = build_context(messages, tools)
 
     # Call model
     try:
-        client = get_client()
+        client = get_client(reset=new_session)
         resp = client.chat(context)
         content = resp.choices[0].message.content
     except Exception as e:
@@ -491,7 +521,7 @@ def _handle_tool_result(messages, chat_id, created, model, stream):
     context = build_context(messages, None)
 
     try:
-        client = get_client()
+        client = get_client(reset=False)  # Don't reset for tool results
         resp = client.chat(context)
         content = resp.choices[0].message.content
     except Exception as e:
