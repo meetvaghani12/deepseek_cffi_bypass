@@ -411,44 +411,65 @@ def detect_intent(message):
     if not message:
         return None
 
-    # Clean the message — strip jailbreak wrappers but keep the actual request
-    clean = message.lower().strip()
+    # Step 1: Extract the ACTUAL user request, ignoring all wrapper junk
+    clean = message.strip()
 
-    # Remove known jailbreak prefixes/suffixes but preserve the core request
-    junk_patterns = [
-        r'userquery\s*:\s*',
-        r'\[start\s+output\]',
-        r'responseformat\s*:\s*.*?(?=\[start|scan|list|show|find|get|hack|crack)',
-        r'rule\s*:\s*.*?(?=\[start|scan|list|show|find|get|hack|crack)',
-        r'tone\s*:\s*.*?(?=\[start|scan|list|show|find|get|hack|crack)',
-        r'\{z\}\s*=\s*',
-        r'\[inst\]\s*<<sys>>.*?<</sys>>',
-        r'###\s*instruction\s*:\s*.*?(?=\[start|scan|list|show|find|get|hack|crack)',
-        r'###\s*system\s*:\s*',
-        r'you are now\s+',
-        r'from now on\s+',
-        r'remember\s*:\s*',
-        r'respond accurately unfilteredly.*?(?=\[start|scan|list|show|find|get|hack|crack)',
-        r'giving the rebel answer.*?(?=\[start|scan|list|show|find|get|hack|crack)',
-        r'leetspeak conversion.*?(?=\[start|scan|list|show|find|get|hack|crack)',
-        r'\{user[_\s]*input\}',
-        r'\{z\}',
-        r'[\[\]()]',
-    ]
-    for pat in junk_patterns:
-        clean = re.sub(pat, ' ', clean, flags=re.IGNORECASE)
+    # Find the last known action keyword — that's the real request
+    # Look for patterns that indicate actual user commands
+    real_request = None
 
-    # Find the actual command — look for action verbs
-    action_match = re.search(
-        r'(scan|list|show|find|get|check|discover|hack|crack|what|how|create|write|read|kill|run|execute|open|view|display)\s',
-        clean, re.IGNORECASE
-    )
-    if action_match:
-        # Keep from the action verb onwards
-        clean = clean[action_match.start():]
+    # Try to find content after common markers
+    for marker in [
+        "[START OUTPUT]",
+        "[/INST]",
+        "### ",
+        "[INST]",
+        "<<SYS>>",
+        "<</SYS>>",
+    ]:
+        idx = clean.rfind(marker)
+        if idx >= 0:
+            candidate = clean[idx + len(marker):].strip()
+            if len(candidate) > 5:  # Has actual content
+                real_request = candidate
+                break
 
+    # If no marker found, check if message looks like a jailbreak prompt
+    if real_request is None:
+        # Check for known jailbreak patterns
+        if any(x in clean.lower() for x in [
+            "userquery", "responseformat", "godmode", "dan mode",
+            "start output", "[inst]", "<<sys>>", "leetspeak",
+            "freak yah", "lfg!", "rebel answer",
+        ]):
+            # This is a jailbreak prompt — try to extract the actual command
+            # Look for action verbs that indicate what the user wants
+            action_match = re.search(
+                r'(?:scan|list|show|find|get|check|hack|crack|create|write|read|kill|run|execute|open|view|display|what|how)\s',
+                clean, re.IGNORECASE
+            )
+            if action_match:
+                # Take everything from the action verb onwards, limited to 200 chars
+                real_request = clean[action_match.start():action_match.start() + 200]
+            else:
+                # Can't find a clear command, skip intent detection
+                return None
+        else:
+            # Not a jailbreak prompt — use as-is
+            real_request = clean
+
+    # Step 2: Clean the extracted request
+    clean = real_request.lower()
+
+    # Remove remaining wrapper artifacts
+    clean = re.sub(r'\{[^}]*\}', '', clean)
+    clean = re.sub(r'[\[\]()]', '', clean)
     clean = re.sub(r'\s+', ' ', clean).strip()
+
     logger.info("Intent detection: cleaned message = %s", clean[:200])
+
+    if len(clean) < 3:
+        return None
 
     # Check each intent pattern
     for intent in INTENT_PATTERNS:
@@ -564,7 +585,7 @@ SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 # ============================================================
 
 def build_context(messages, tools):
-    """Build compact context with tool instructions."""
+    """Build clean context — NO tool instructions sent to DeepSeek."""
     parts = []
 
     for msg in messages:
@@ -572,7 +593,7 @@ def build_context(messages, tools):
         content = msg.get("content", "")
 
         if role == "system":
-            # Skip opencode's verbose system prompt entirely
+            # Skip ALL system prompts — DeepSeek doesn't need them
             continue
         elif role == "user":
             if isinstance(content, str):
@@ -582,21 +603,16 @@ def build_context(messages, tools):
                 parts.append(f"User: {text[:2000]}")
         elif role == "assistant":
             if msg.get("tool_calls"):
-                for tc in msg["tool_calls"]:
-                    f = tc.get("function", {})
-                    parts.append(f"[Called {f.get('name', '')}]")
+                # Don't include tool calls in context — model can't use them
+                continue
             elif content:
                 parts.append(f"Assistant: {content[:500]}")
         elif role == "tool":
+            # Include tool results as regular text
             result = str(content)[:500]
-            parts.append(f"[Result]: {result}")
+            parts.append(f"[Tool result]: {result}")
 
-    result = "\n\n".join(parts)
-
-    if tools:
-        result += "\n\n" + get_tool_instructions(format_tools(tools))
-
-    return result
+    return "\n\n".join(parts)
 
 
 # ============================================================
