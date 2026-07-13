@@ -187,18 +187,21 @@ class PersistentSession:
         except Exception as e:
             logger.warning("Worker PoW failed (%s), falling back to CDP intercept", e)
 
-        # Fallback: CDP intercept (slower, types in browser)
+        # Fallback: CDP intercept (slower, types in browser) — retry up to 2 times
         if not pow_resp:
-            try:
-                captured = self._run(self.browser_session.intercept_pow)
-                auth = captured.get("auth", auth)
-                pow_resp = captured.get("pow")
-                if captured.get("session_id") and "json" in kwargs:
-                    kwargs["json"]["chat_session_id"] = captured["session_id"]
-                logger.info("PoW captured via CDP intercept")
-            except Exception as e:
-                logger.error("CDP intercept also failed: %s", e)
-                raise
+            for attempt in range(2):
+                try:
+                    captured = self._run(self.browser_session.intercept_pow)
+                    auth = captured.get("auth", auth)
+                    pow_resp = captured.get("pow")
+                    if captured.get("session_id") and "json" in kwargs:
+                        kwargs["json"]["chat_session_id"] = captured["session_id"]
+                    logger.info("PoW captured via CDP intercept")
+                    break
+                except Exception as e:
+                    logger.warning("CDP intercept attempt %d failed: %s", attempt + 1, e)
+                    if attempt == 1:
+                        raise
 
         headers = self._get_headers(auth_token=auth, pow_response=pow_resp)
         headers.update(kwargs.pop("headers", {}))

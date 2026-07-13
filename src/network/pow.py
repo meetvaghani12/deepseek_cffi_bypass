@@ -178,37 +178,24 @@ def get_pow_via_cdp_intercept(page, context) -> dict:
 
     client.on("Fetch.requestPaused", on_fetch_request)
 
-    # Navigate to new chat
+    # Always navigate to fresh chat first
     try:
-        page.locator('text=New chat').first.click(timeout=3000)
-        time.sleep(3)
-    except Exception:
-        pass
+        page.goto("https://chat.deepseek.com/", timeout=15000)
+        time.sleep(4)
+    except Exception as e:
+        logger.warning("Navigate to fresh chat failed: %s", e)
 
     # Type and send
     try:
         el = page.locator("textarea").first
-        el.wait_for(timeout=5000)
+        el.wait_for(timeout=8000)
         el.click()
-        time.sleep(0.3)
+        time.sleep(0.5)
         el.fill("hello")
-        time.sleep(0.3)
+        time.sleep(0.5)
         el.press("Enter")
     except Exception as e:
         logger.warning("Could not type message: %s", e)
-        # Try navigating to fresh chat
-        try:
-            page.goto("https://chat.deepseek.com/", timeout=10000)
-            time.sleep(3)
-            el = page.locator("textarea").first
-            el.wait_for(timeout=5000)
-            el.click()
-            time.sleep(0.3)
-            el.fill("hello")
-            time.sleep(0.3)
-            el.press("Enter")
-        except Exception as e2:
-            logger.error("Retry also failed: %s", e2)
 
     for _ in range(30):
         time.sleep(1)

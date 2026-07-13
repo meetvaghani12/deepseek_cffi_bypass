@@ -53,6 +53,17 @@ class DeepSeekClient:
                 choices=[Choice(message=ChatMessage(role="assistant", content=f"Error: {resp.status_code}"))],
             )
 
+        # Check for invalid message id error and reset session
+        try:
+            resp_json = resp.json()
+            if resp_json.get("data", {}).get("biz_code") == 26:
+                logger.warning("Invalid message id — resetting session")
+                self._session_id = None
+                self._parent_message_id = None
+                return self.chat(message, **kwargs)
+        except Exception:
+            pass
+
         content = ""
         msg_id = None
         last_p = ""
@@ -83,7 +94,26 @@ class DeepSeekClient:
             if p:
                 last_p = p
 
-            if "response/content" in last_p or "response/fragments" in last_p:
+            # Format 1: v contains response object directly (no p field)
+            if isinstance(v, dict) and "response" in v:
+                resp_obj = v.get("response", {})
+                fragments = resp_obj.get("fragments", [])
+                for frag in fragments:
+                    frag_content = frag.get("content", "")
+                    if frag_content:
+                        content += frag_content
+
+            # Format 2: p == "response" with nested v
+            elif p == "response" and isinstance(v, dict):
+                resp_obj = v.get("response", {})
+                fragments = resp_obj.get("fragments", [])
+                for frag in fragments:
+                    frag_content = frag.get("content", "")
+                    if frag_content:
+                        content += frag_content
+
+            # Format 3: legacy — content in v string
+            elif "response/content" in last_p or "response/fragments" in last_p:
                 if isinstance(v, str) and v:
                     content += v
             elif last_p == "response/status" and v == "FINISHED":
