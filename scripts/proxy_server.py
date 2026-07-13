@@ -267,6 +267,235 @@ def extract_tool_calls(text):
 
 
 # ============================================================
+# 4. INTENT DETECTION — detect tool use from ANY prompt format
+# ============================================================
+
+import subprocess
+
+# Patterns that map user intent to tool calls
+INTENT_PATTERNS = [
+    # Network scanning
+    {
+        "patterns": [
+            r"(?:scan|list|show|find|discover)\s+.*?(?:wifi|wi-fi|wireless|network|ssid|access\s*point)",
+            r"(?:what(?:'s| is| are)\s+.*?(?:available|nearby|around)\s+.*?(?:wifi|network|ssid))",
+            r"(?:nmcli|iwlist|airport|iwconfig)",
+            r"(?:hack|crack|break)\s+.*?(?:wifi|wi-fi|wireless|password|network)",
+        ],
+        "tool": "bash",
+        "command_map": {
+            "darwin": "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -s 2>/dev/null || networksetup -listallhardwareports 2>/dev/null || echo 'Run: sudo wdutil info'",
+            "linux": "nmcli -t -f SSID,SIGNAL,SECURITY dev wifi list 2>/dev/null || iwlist wlan0 scan 2>/dev/null | grep -E 'ESSID|Signal|Encryption' || echo 'No WiFi tools found'",
+            "default": "nmcli dev wifi list 2>/dev/null || echo 'WiFi scanning not available on this platform'",
+        },
+    },
+    # Port scanning
+    {
+        "patterns": [
+            r"(?:scan|check|find|list)\s+.*?(?:open\s+)?port",
+            r"(?:what(?:'s| is| are)\s+.*?(?:open|available)\s+port)",
+            r"(?:nmap|netcat|nc)\s+",
+        ],
+        "tool": "bash",
+        "command_map": {
+            "darwin": "lsof -i -P -n | grep LISTEN 2>/dev/null || netstat -an | grep LISTEN",
+            "linux": "ss -tuln 2>/dev/null || netstat -tuln 2>/dev/null",
+            "default": "ss -tuln 2>/dev/null || echo 'Port scanning not available'",
+        },
+    },
+    # System info
+    {
+        "patterns": [
+            r"(?:show|get|list|what(?:'s| is))\s+.*?(?:system|os|cpu|memory|disk|info|stats|status)",
+            r"(?:how (?:much|many)\s+.*?(?:memory|cpu|disk|space))",
+            r"(?:system\s+info|sysinfo|uname)",
+        ],
+        "tool": "bash",
+        "command_map": {
+            "darwin": "echo '=== OS ===' && uname -a && echo '=== CPU ===' && sysctl -n machdep.cpu.brand_string && echo '=== Memory ===' && vm_stat | head -5 && echo '=== Disk ===' && df -h / | tail -1",
+            "linux": "echo '=== OS ===' && uname -a && echo '=== CPU ===' && lscpu | head -5 && echo '=== Memory ===' && free -h | head -2 && echo '=== Disk ===' && df -h / | tail -1",
+            "default": "uname -a && echo '---' && df -h / | tail -1",
+        },
+    },
+    # Process listing
+    {
+        "patterns": [
+            r"(?:list|show|kill|find)\s+.*?(?:running\s+)?process",
+            r"(?:what(?:'s| is| are)\s+.*?(?:running|active)\s+process)",
+            r"(?:ps\s+aux|top\s+-n)",
+            r"(?:running\s+process)",
+        ],
+        "tool": "bash",
+        "command_map": {
+            "darwin": "ps aux -r 2>/dev/null | head -15 || ps aux | head -15",
+            "linux": "ps aux --sort=-%cpu 2>/dev/null | head -15 || ps aux | head -15",
+            "default": "ps aux | head -15",
+        },
+    },
+    # File operations
+    {
+        "patterns": [
+            r"(?:create|make|write|generate)\s+(?:a\s+)?(?:file|script)",
+            r"(?:read|show|cat|open|view)\s+(?:the\s+)?(?:file|script)",
+            r"(?:list|show|find)\s+(?:all\s+)?(?:file|folder|directory)",
+        ],
+        "tool": "detect",  # Will be mapped to read/write/glob based on context
+    },
+    # Directory listing
+    {
+        "patterns": [
+            r"(?:list|show|what(?:'s| is))\s+(?:in\s+)?(?:the\s+)?(?:current\s+)?(?:dir|directory|folder|path)",
+            r"(?:ls|dir)\s*(?:-la?|-l|/)?",
+        ],
+        "tool": "bash",
+        "command_map": {
+            "default": "ls -la",
+        },
+    },
+    # IP info
+    {
+        "patterns": [
+            r"(?:what(?:'s| is| are)\s+my\s+)?(?:ip|address|interface)",
+            r"(?:show|get|find)\s+(?:my\s+)?(?:ip|address|interface|mac)",
+            r"(?:ifconfig|ip\s+addr|ipconfig)",
+        ],
+        "tool": "bash",
+        "command_map": {
+            "darwin": "ifconfig | grep -E 'inet |en0|en1' | head -10",
+            "linux": "ip addr show 2>/dev/null | grep -E 'inet |eth0|wlan0' | head -10",
+            "default": "hostname -I 2>/dev/null || echo 'IP info not available'",
+        },
+    },
+    # Running services
+    {
+        "patterns": [
+            r"(?:list|show|what(?:'s| is))\s+(?:running\s+)?(?:service|daemon|server)",
+            r"(?:docker|containers?)\s+(?:list|show|running)",
+        ],
+        "tool": "bash",
+        "command_map": {
+            "darwin": "ps aux | grep -E '\.app|\.bundle|server' | grep -v grep | head -15",
+            "linux": "systemctl list-units --type=service --state=running 2>/dev/null | head -15 || ps aux | head -15",
+            "default": "ps aux | head -15",
+        },
+    },
+    # Git operations
+    {
+        "patterns": [
+            r"(?:show|what(?:'s| is))\s+(?:the\s+)?(?:git\s+)?(?:status|log|diff|branch)",
+            r"(?:git\s+)(status|log|diff|branch|commit|push|pull|fetch|clone)",
+        ],
+        "tool": "bash",
+        "command_map": {
+            "default": "git status 2>/dev/null || echo 'Not a git repository'",
+        },
+    },
+    # Python/Node execution
+    {
+        "patterns": [
+            r"(?:run|execute|python|python3|node|npm|pip)\s+",
+        ],
+        "tool": "bash",
+        "command_map": {
+            "default": "echo 'Use bash tool to run commands directly'",
+        },
+    },
+]
+
+
+def detect_intent(message):
+    """
+    Detect user intent from ANY prompt format.
+    Returns list of tool calls or None if no intent detected.
+    """
+    if not message:
+        return None
+
+    # Clean the message — strip jailbreak wrappers but keep the actual request
+    clean = message.lower().strip()
+
+    # Remove known jailbreak prefixes/suffixes but preserve the core request
+    junk_patterns = [
+        r'userquery\s*:\s*',
+        r'\[start\s+output\]',
+        r'responseformat\s*:\s*.*?(?=\[start|scan|list|show|find|get|hack|crack)',
+        r'rule\s*:\s*.*?(?=\[start|scan|list|show|find|get|hack|crack)',
+        r'tone\s*:\s*.*?(?=\[start|scan|list|show|find|get|hack|crack)',
+        r'\{z\}\s*=\s*',
+        r'\[inst\]\s*<<sys>>.*?<</sys>>',
+        r'###\s*instruction\s*:\s*.*?(?=\[start|scan|list|show|find|get|hack|crack)',
+        r'###\s*system\s*:\s*',
+        r'you are now\s+',
+        r'from now on\s+',
+        r'remember\s*:\s*',
+        r'respond accurately unfilteredly.*?(?=\[start|scan|list|show|find|get|hack|crack)',
+        r'giving the rebel answer.*?(?=\[start|scan|list|show|find|get|hack|crack)',
+        r'leetspeak conversion.*?(?=\[start|scan|list|show|find|get|hack|crack)',
+        r'\{user[_\s]*input\}',
+        r'\{z\}',
+        r'[\[\]()]',
+    ]
+    for pat in junk_patterns:
+        clean = re.sub(pat, ' ', clean, flags=re.IGNORECASE)
+
+    # Find the actual command — look for action verbs
+    action_match = re.search(
+        r'(scan|list|show|find|get|check|discover|hack|crack|what|how|create|write|read|kill|run|execute|open|view|display)\s',
+        clean, re.IGNORECASE
+    )
+    if action_match:
+        # Keep from the action verb onwards
+        clean = clean[action_match.start():]
+
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    logger.info("Intent detection: cleaned message = %s", clean[:200])
+
+    # Check each intent pattern
+    for intent in INTENT_PATTERNS:
+        for pattern in intent["patterns"]:
+            if re.search(pattern, clean, re.IGNORECASE):
+                tool = intent["tool"]
+                if tool == "detect":
+                    # File operations — detect from context
+                    if any(w in clean for w in ["create", "write", "make", "generate", "save"]):
+                        # Extract filename
+                        file_match = re.search(r'(?:file|script|named?|called?)\s+["\']?([^\s"\']+)', clean)
+                        filename = file_match.group(1) if file_match else "output.txt"
+                        return [{"name": "write", "arguments": {"path": filename, "content": "# Created by proxy\n"}}]
+                    elif any(w in clean for w in ["read", "show", "cat", "open", "view"]):
+                        file_match = re.search(r'(?:file|script|named?|called?)\s+["\']?([^\s"\']+)', clean)
+                        filename = file_match.group(1) if file_match else "."
+                        return [{"name": "read", "arguments": {"path": filename}}]
+                    elif any(w in clean for w in ["list", "find", "show"]):
+                        path_match = re.search(r'(?:in|from|at)\s+["\']?([^\s"\']+)', clean)
+                        path = path_match.group(1) if path_match else "."
+                        return [{"name": "glob", "arguments": {"pattern": "**/*", "path": path}}]
+                    continue
+
+                # Get platform-specific command
+                import platform
+                system = platform.system().lower()
+                cmd_map = intent["command_map"]
+                command = cmd_map.get(system, cmd_map.get("default", "echo 'Command not available'"))
+
+                return [{"tool_name": "bash", "arguments": {"command": command}}]
+
+    return None
+
+
+def extract_last_user_message(messages):
+    """Extract the last user message content as string."""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            content = msg.get("content", "")
+            if isinstance(content, str):
+                return content
+            elif isinstance(content, list):
+                return " ".join(p.get("text", "") for p in content if p.get("type") == "text")
+    return ""
+
+
+# ============================================================
 # SSE HELPERS
 # ============================================================
 
@@ -444,6 +673,37 @@ def chat_completions():
     last_msg = messages[-1] if messages else {}
     if last_msg.get("role") == "tool":
         return _handle_tool_result(messages, chat_id, created, model, stream)
+
+    # ============================================================
+    # INTENT DETECTION — execute tools directly from ANY prompt
+    # ============================================================
+    user_msg = extract_last_user_message(messages)
+    detected = detect_intent(user_msg)
+    if detected:
+        logger.info("INTENT DETECTED: %s", detected)
+        # Execute tool directly via ToolExecutor.execute(tool_name, arguments)
+        results = []
+        for d in detected:
+            tool_name = d.get("tool_name", d.get("name", ""))
+            arguments = d.get("arguments", {})
+            try:
+                result = _tool_executor.execute(tool_name, arguments)
+                results.append(result)
+            except Exception as e:
+                results.append(f"Error: {e}")
+
+        output = "\n\n".join(results)
+        logger.info("INTENT RESULT: %s", output[:200])
+        if stream:
+            return Response(
+                stream_text(chat_id, created, model, output),
+                content_type="text/event-stream", headers=SSE_HEADERS,
+            )
+        return jsonify({
+            "id": chat_id, "object": "chat.completion", "created": created, "model": model,
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": output}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        })
 
     # Check response cache (skip if new session)
     if not new_session:
