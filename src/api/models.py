@@ -20,3 +20,7 @@ class Choice(BaseModel):
 class ChatResponse(BaseModel):
     id: str
     choices: List[Choice]
+    # DeepSeek's native message_id in its original type (int). Kept separate from `id`
+    # (a display string) because it must round-trip as parent_message_id, which the
+    # DeepSeek API validates as a u32 — a string there causes a 422.
+    message_id: Optional[Any] = None

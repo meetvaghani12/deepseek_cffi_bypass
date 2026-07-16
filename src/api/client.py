@@ -3,133 +3,111 @@ import uuid
 import logging
 from typing import Optional
 from src.network.session import PersistentSession
+from src.api.sse_parser import parse_stream
 from src.api.models import ChatResponse, Choice, ChatMessage
 
 logger = logging.getLogger(__name__)
 
 
 class DeepSeekClient:
+    """
+    Thin client over chat.deepseek.com's `/api/v0/chat/completion`.
+
+    Maintains a single DeepSeek chat session and chains `parent_message_id` so the
+    server keeps (and caches) conversation context across turns. Callers that manage
+    their own multi-session mapping should pass `chat_session_id`/`parent_message_id`
+    explicitly and read `.message_id` off the response to chain the next turn.
+    """
+
     def __init__(self, session: PersistentSession = None):
         self.session = session or PersistentSession()
         self._session_id = None
         self._parent_message_id = None
 
-    def chat(self, message: str, **kwargs) -> ChatResponse:
-        session_id = kwargs.pop("chat_session_id", None)
-        if not session_id:
-            if not self._session_id:
-                self._session_id = self.session.create_session()
-            session_id = self._session_id
+    def reset(self) -> None:
+        """Forget the current DeepSeek session so the next chat() starts a fresh one."""
+        self._session_id = None
+        self._parent_message_id = None
 
-        parent_id = kwargs.pop("parent_message_id", None)
-        if parent_id is None:
-            parent_id = self._parent_message_id
+    def create_session(self) -> str:
+        """Create a fresh DeepSeek chat session and return its id."""
+        return self.session.create_session()
+
+    def chat(
+        self,
+        message: str,
+        chat_session_id: Optional[str] = None,
+        parent_message_id: Optional[str] = None,
+        thinking_enabled: bool = False,
+        search_enabled: bool = False,
+        **kwargs,
+    ) -> ChatResponse:
+        # Resolve the session id: explicit arg > instance state > create new.
+        session_id = chat_session_id or self._session_id
+        if not session_id:
+            session_id = self._session_id = self.session.create_session()
+
+        # Resolve parent: explicit arg wins (including explicit None for a fresh root
+        # is expressed by passing chat_session_id with parent_message_id omitted).
+        parent_id = parent_message_id if parent_message_id is not None else self._parent_message_id
+
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": parent_id,
             "model_type": "default",
             "prompt": message,
             "ref_file_ids": [],
-            "thinking_enabled": kwargs.pop("thinking_enabled", False),
-            "search_enabled": kwargs.pop("search_enabled", True),
+            "thinking_enabled": thinking_enabled,
+            "search_enabled": search_enabled,
             "action": None,
             "preempt": False,
         }
         payload.update(kwargs)
 
-        logger.info("Sending chat request (session=%s, parent=%s)", session_id, parent_id)
+        logger.info("chat request (session=%s parent=%s len=%d)", session_id, parent_id, len(message))
 
         resp = self.session.post(
             "https://chat.deepseek.com/api/v0/chat/completion",
             json=payload,
         )
 
-        logger.info("Response status: %d", resp.status_code)
-
         if resp.status_code != 200:
-            logger.error("Non-200 response: %s", resp.text[:500])
+            logger.error("non-200 (%d): %s", resp.status_code, resp.text[:500])
             return ChatResponse(
                 id="error",
-                choices=[Choice(message=ChatMessage(role="assistant", content=f"Error: {resp.status_code}"))],
+                choices=[Choice(message=ChatMessage(role="assistant",
+                                                    content=f"[proxy error] DeepSeek returned {resp.status_code}"))],
             )
 
-        # Check for invalid message id error and reset session
+        # A biz_code 26 means the parent_message_id is stale — reset once and retry.
+        # NB: use `(head.get("data") or {})` — `.get("data", {})` returns None when the
+        # JSON is literally {"data": null}, and None.get(...) would crash.
         try:
-            resp_json = resp.json()
-            if resp_json.get("data", {}).get("biz_code") == 26:
-                logger.warning("Invalid message id — resetting session")
-                self._session_id = None
-                self._parent_message_id = None
-                return self.chat(message, **kwargs)
-        except Exception:
-            pass
+            head = resp.json()
+            if isinstance(head, dict) and (head.get("data") or {}).get("biz_code") == 26:
+                logger.warning("stale message id (biz_code 26) — resetting session and retrying")
+                self.reset()
+                return self.chat(message, thinking_enabled=thinking_enabled,
+                                 search_enabled=search_enabled, **kwargs)
+        except (json.JSONDecodeError, ValueError):
+            pass  # SSE body isn't a single JSON object — expected on success.
 
-        content = ""
-        msg_id = None
-        last_p = ""
+        parsed = parse_stream(resp.text)
 
-        for line in resp.text.split("\n"):
-            line = line.strip()
-            if not line.startswith("data: "):
-                continue
-            data_str = line[6:]
-            if data_str == "{}":
-                continue
+        if parsed.error:
+            logger.error("stream error: %s", parsed.error)
+        if not parsed.content and not parsed.thinking:
+            logger.warning("empty response; raw SSE head: %s", resp.text[:800])
 
-            try:
-                data = json.loads(data_str)
-            except Exception:
-                continue
+        # Chain the next turn only when we own the session state.
+        if parsed.message_id and chat_session_id is None:
+            self._parent_message_id = parsed.message_id
 
-            if not isinstance(data, dict):
-                continue
-
-            # Extract response_message_id from ready event
-            if "response_message_id" in data:
-                msg_id = data["response_message_id"]
-
-            p = data.get("p", "")
-            v = data.get("v", "")
-
-            if p:
-                last_p = p
-
-            # Format 1: v contains response object directly (no p field)
-            if isinstance(v, dict) and "response" in v:
-                resp_obj = v.get("response", {})
-                fragments = resp_obj.get("fragments", [])
-                for frag in fragments:
-                    frag_content = frag.get("content", "")
-                    if frag_content:
-                        content += frag_content
-
-            # Format 2: p == "response" with nested v
-            elif p == "response" and isinstance(v, dict):
-                resp_obj = v.get("response", {})
-                fragments = resp_obj.get("fragments", [])
-                for frag in fragments:
-                    frag_content = frag.get("content", "")
-                    if frag_content:
-                        content += frag_content
-
-            # Format 3: legacy — content in v string
-            elif "response/content" in last_p or "response/fragments" in last_p:
-                if isinstance(v, str) and v:
-                    content += v
-            elif last_p == "response/status" and v == "FINISHED":
-                logger.info("Response finished")
-
-        logger.info("Chat response: %s", content[:200] if content else "(empty)")
-
-        if not content:
-            logger.warning("Empty response. Raw SSE (first 1000 chars): %s", resp.text[:1000])
-
-        if msg_id:
-            self._parent_message_id = msg_id
-
-        logger.info("Extracted msg_id=%s, content_len=%d", msg_id, len(content))
+        logger.info("chat response (msg_id=%s content_len=%d thinking_len=%d)",
+                    parsed.message_id, len(parsed.content), len(parsed.thinking))
 
         return ChatResponse(
-            id=str(msg_id or uuid.uuid4()),
-            choices=[Choice(message=ChatMessage(role="assistant", content=content))],
+            id=str(parsed.message_id or uuid.uuid4()),
+            message_id=parsed.message_id,  # native type for parent_message_id chaining
+            choices=[Choice(message=ChatMessage(role="assistant", content=parsed.content))],
         )

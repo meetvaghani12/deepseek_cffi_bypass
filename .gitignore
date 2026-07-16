@@ -15,6 +15,7 @@ venv/
 data/browser_profile/
 data/session.json
 data/proxies.json
+data/debug/
 logs/
 *.log
 *.png

@@ -1,869 +1,481 @@
 """
-Optimized OpenAI-compatible proxy with all performance improvements.
+DeepSeek → OpenAI-compatible proxy for opencode.
 
- Improvements implemented:
- 1. PoW Caching      — pre-solve and cache PoW tokens (saves 2-10s per request)
- 2. Direct HTTP      — use curl_cffi directly, skip browser when possible (saves 200ms)
- 3. Connection Pool  — reuse TLS session and TCP connections (saves 100ms)
- 4. Context Opt      — smaller prompts, compressed history (saves 500ms)
- 5. Parallel Tools   — support multiple tool calls in one response (saves 5-20s)
- 6. Response Cache   — cache common responses (saves 1-5s)
+Architecture (see research memos): opencode does NATIVE function calling via the Vercel
+AI SDK — it sends OpenAI `tools`, runs its OWN agentic loop, and executes tools itself.
+The web DeepSeek model only takes text and returns text. So this proxy is a TRANSLATOR,
+not an agent:
+
+  opencode --(OpenAI request: messages + tools)-->  proxy
+  proxy    --(XML tool-teaching prompt + new turns)-->  DeepSeek web session
+  DeepSeek --(text, possibly an XML tool call)-->  proxy
+  proxy    --(native OpenAI tool_calls OR plain text)-->  opencode
+  opencode executes the tool, appends the result, and calls the proxy again...
+
+The proxy NEVER executes tools (opencode does that). It maps opencode's stateless full-
+history requests onto DeepSeek's stateful session so context is cached server-side.
 """
 import json
 import re
-import uuid
 import time
-import hashlib
+import uuid
 import logging
 import threading
-import os
-import traceback
-from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
+
 from flask import Flask, request, jsonify, Response
 
 import sys
+import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from scripts.agent_swarm import ToolExecutor
+from src.proxy.tool_protocol import (
+    build_tool_system_prompt,
+    parse_tool_calls,
+    to_openai_tool_call,
+    strip_thinking,
+)
+from src.proxy.conversation import ConversationTracker
+from src.proxy.render import render_turns
+from src.proxy.tool_filter import filter_tools, summarize_filter
+from src.proxy import anthropic_api
+from src.proxy import aux_requests
 
 app = Flask(__name__)
 logger = logging.getLogger(__name__)
 
-_tool_executor = ToolExecutor()
+MODEL_ID = "deepseek-chat"
 
-# ============================================================
-# 1. PoW CACHE — pre-solve and cache PoW tokens
-# ============================================================
-
-class PoWCache:
-    """Pre-solves PoW in background thread and caches valid tokens."""
-
-    def __init__(self, max_cache=20, ttl=300):
-        self._cache = OrderedDict()
-        self._lock = threading.Lock()
-        self._max = max_cache
-        self._ttl = ttl
-        self._solving = False
-        self._client = None
-        self._client_lock = threading.Lock()
-
-    def _get_client(self):
-        if self._client is None:
-            from src.api.client import DeepSeekClient
-            self._client = DeepSeekClient()
-        return self._client
-
-    def get_pow(self):
-        """Get a cached PoW or solve a new one."""
-        with self._lock:
-            now = time.time()
-            while self._cache:
-                key, (solution, ts) = next(iter(self._cache.items()))
-                if now - ts < self._ttl:
-                    self._cache.move_to_end(key)
-                    return solution
-                self._cache.popitem()
-
-        # Nothing cached — solve now
-        return self._solve()
-
-    def _solve(self):
-        """Solve PoW synchronously."""
-        try:
-            client = self._get_client()
-            # Trigger a minimal chat to force PoW solve
-            resp = client.chat("Hi")
-            # The PoW was solved during the request
-            return getattr(client, '_last_pow', None)
-        except Exception as e:
-            logger.warning("PoW solve failed: %s", e)
-            return None
-
-    def prefill(self, count=5):
-        """Pre-fill cache in background."""
-        def _worker():
-            for _ in range(count):
-                try:
-                    solution = self._solve()
-                    if solution:
-                        with self._lock:
-                            key = hashlib.md5(solution.encode()).hexdigest()[:12]
-                            self._cache[key] = (solution, time.time())
-                            if len(self._cache) > self._max:
-                                self._cache.popitem(last=False)
-                except Exception:
-                    pass
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def put(self, solution):
-        """Manually add a solved PoW to cache."""
-        if not solution:
-            return
-        with self._lock:
-            key = hashlib.md5(solution.encode()).hexdigest()[:12]
-            self._cache[key] = (solution, time.time())
-            if len(self._cache) > self._max:
-                self._cache.popitem(last=False)
-
-
-_pow_cache = PoWCache()
-
-# ============================================================
-# 2. RESPONSE CACHE — cache common responses
-# ============================================================
-
-class ResponseCache:
-    """LRU cache for chat responses with TTL."""
-
-    def __init__(self, max_size=50, ttl=600):
-        self._cache = OrderedDict()
-        self._lock = threading.Lock()
-        self._max = max_size
-        self._ttl = ttl
-        self._hits = 0
-        self._misses = 0
-
-    def _key(self, messages, tools):
-        """Generate cache key from messages + tools."""
-        # Only cache based on last user message + tool list
-        last_user = ""
-        for m in reversed(messages):
-            if m.get("role") == "user":
-                c = m.get("content", "")
-                last_user = c if isinstance(c, str) else str(c)
-                break
-        tool_names = tuple(t.get("function", {}).get("name", "") for t in (tools or []))
-        raw = f"{last_user}|{'|'.join(tool_names)}"
-        return hashlib.md5(raw.encode()).hexdigest()
-
-    def get(self, messages, tools):
-        key = self._key(messages, tools)
-        with self._lock:
-            if key in self._cache:
-                entry = self._cache[key]
-                if time.time() - entry["ts"] < self._ttl:
-                    self._cache.move_to_end(key)
-                    self._hits += 1
-                    return entry["response"]
-                self._cache.pop(key)
-        self._misses += 1
-        return None
-
-    def put(self, messages, tools, response):
-        key = self._key(messages, tools)
-        with self._lock:
-            self._cache[key] = {"response": response, "ts": time.time()}
-            if len(self._cache) > self._max:
-                self._cache.popitem(last=False)
-
-    def stats(self):
-        return {"hits": self._hits, "misses": self._misses, "size": len(self._cache)}
-
-
-_response_cache = ResponseCache()
-
-# Track message count per opencode session to detect new sessions
-_msg_counter = 0
-_last_msg_count = 0
-
-
-def detect_new_session(messages):
-    """Detect if opencode started a new session by checking message count."""
-    global _msg_counter, _last_msg_count
-    current_count = len(messages)
-    if current_count < _last_msg_count:
-        logger.info("NEW SESSION detected (msgs: %d -> %d)", _last_msg_count, current_count)
-        return True
-    _last_msg_count = current_count
-    return False
-
-# ============================================================
-# 3. CLIENT MANAGER — connection pooling + direct HTTP
-# ============================================================
-
+# ---------------------------------------------------------------------------
+# Shared state
+# ---------------------------------------------------------------------------
+_tracker = ConversationTracker()
 _client = None
 _client_lock = threading.Lock()
-_session_counter = 0
-_session_lock = threading.Lock()
 
 
-def get_client(reset=False):
-    """Get or create DeepSeek client. reset=True creates new chat session."""
-    global _client, _session_counter
+def get_client():
+    global _client
     with _client_lock:
         if _client is None:
             from src.api.client import DeepSeekClient
             _client = DeepSeekClient()
-            logger.info("DeepSeek client created")
-        if reset:
-            # Reset session tracking — next chat() will create new DeepSeek session
-            _client._session_id = None
-            _client._parent_message_id = None
-            with _session_lock:
-                _session_counter += 1
-            logger.info("Session reset (counter=%d)", _session_counter)
+            logger.info("DeepSeek client initialized")
         return _client
 
 
-# ============================================================
-# CONTEXT OPTIMIZATION — smaller prompts
-# ============================================================
+# ---------------------------------------------------------------------------
+# Core translation: run one opencode request against DeepSeek
+# ---------------------------------------------------------------------------
 
-def format_tools(tools):
-    if not tools:
-        return ""
-    lines = []
-    for t in tools:
-        f = t.get("function", {})
-        name = f.get("name", "")
-        desc = f.get("description", "")[:80]
-        params = list(f.get("parameters", {}).get("properties", {}).keys())
-        lines.append(f"- {name}: {desc} ({', '.join(params[:3])})")
-    return "\n".join(lines)
-
-
-def get_tool_instructions(tools_desc):
-    return (
-        "You have tools. Use them when asked.\n"
-        "Format:\n"
-        '<tool_call>{"name":"tool","arguments":{...}}</tool_call>\n\n'
-        f"Tools:\n{tools_desc}"
+def run_turn(messages, tools, conversation_id=None, model=""):
+    """
+    Execute one client request against DeepSeek and return
+    (assistant_text, tool_calls) where exactly one is meaningful:
+      - tool_calls non-empty  -> the client should execute them
+      - else assistant_text   -> final text for this turn
+    `conversation_id` (Claude Code's stable session id) keys the session mapping.
+    """
+    # Short-circuit Claude Code's auxiliary requests (title-gen, autocomplete, quota)
+    # BEFORE any DeepSeek work — no chat, no PoW, no latency, no output pollution.
+    upstream_system = " ".join(
+        (m.get("content") if isinstance(m.get("content"), str) else "")
+        for m in messages if m.get("role") == "system"
     )
+    aux = aux_requests.classify_and_answer(messages, upstream_system, model=model)
+    if aux is not None:
+        logger.info("aux request short-circuited (%d chars)", len(aux))
+        return aux, []
 
+    # Claude Code / opencode with many MCP servers can send 300-400 tools; DeepSeek can't
+    # pick from that many and the catalog drowns the task. Filter to tools relevant to
+    # THIS conversation (all core tools + MCP tools whose server is mentioned).
+    if tools:
+        convo_text = " ".join(
+            (m.get("content") if isinstance(m.get("content"), str) else "")
+            for m in messages
+        )
+        original_tools = tools
+        tools = filter_tools(tools, convo_text)
+        if len(tools) != len(original_tools):
+            logger.info(summarize_filter(original_tools, tools))
 
-def extract_tool_calls(text):
-    """Extract tool calls — handles XML, plain JSON, and nested JSON."""
-    calls = []
+    system_prompt = build_tool_system_prompt(tools) if tools else ""
+    plan = _tracker.plan_turn(messages, system_prompt, conversation_id=conversation_id)
 
-    # 1. XML tags
-    for m in re.findall(r'<tool_call>\s*(\{.*?\})\s*</tool_call>', text, re.DOTALL):
-        try:
-            obj = json.loads(m)
-            if "name" in obj:
-                calls.append(obj)
-        except json.JSONDecodeError:
-            pass
-    if calls:
-        return calls
+    prompt = render_turns(plan.new_turns, plan.is_new_session, plan.system_prompt)
+    if not prompt.strip():
+        return "", []
 
-    # 2. Plain JSON with name+arguments
-    for m in re.finditer(r'\{[^{}]*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^{}]*\})\s*\}', text):
-        try:
-            calls.append({"name": m.group(1), "arguments": json.loads(m.group(2))})
-        except json.JSONDecodeError:
-            pass
-    if calls:
-        return calls
+    client = get_client()
 
-    # 3. Nested JSON arguments
-    for m in re.finditer(r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{.*?\})\s*\}', text, re.DOTALL):
-        try:
-            calls.append({"name": m.group(1), "arguments": json.loads(m.group(2))})
-        except json.JSONDecodeError:
-            pass
+    # Resolve the DeepSeek session for this conversation.
+    if plan.is_new_session or not plan.prior_session_id:
+        session_id = client.create_session()
+        parent_id = None
+    else:
+        session_id = plan.prior_session_id
+        parent_id = plan.prior_parent_id
 
-    return calls
+    resp = client.chat(
+        prompt,
+        chat_session_id=session_id,
+        parent_message_id=parent_id,
+        thinking_enabled=False,
+        search_enabled=False,
+    )
+    raw = resp.choices[0].message.content or ""
+    new_parent = resp.message_id if resp.id != "error" else None
+    calls = parse_tool_calls(raw, tools) if tools else []
 
-
-# ============================================================
-# 4. INTENT DETECTION — detect tool use from ANY prompt format
-# ============================================================
-
-import subprocess
-
-# Patterns that map user intent to tool calls
-INTENT_PATTERNS = [
-    # Network scanning
-    {
-        "patterns": [
-            r"(?:scan|list|show|find|discover)\s+.*?(?:wifi|wi-fi|wireless|network|ssid|access\s*point)",
-            r"(?:what(?:'s| is| are)\s+.*?(?:available|nearby|around)\s+.*?(?:wifi|network|ssid))",
-            r"(?:nmcli|iwlist|airport|iwconfig)",
-            r"(?:hack|crack|break)\s+.*?(?:wifi|wi-fi|wireless|password|network)",
-        ],
-        "tool": "bash",
-        "command_map": {
-            "darwin": "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -s 2>/dev/null || networksetup -listallhardwareports 2>/dev/null || echo 'Run: sudo wdutil info'",
-            "linux": "nmcli -t -f SSID,SIGNAL,SECURITY dev wifi list 2>/dev/null || iwlist wlan0 scan 2>/dev/null | grep -E 'ESSID|Signal|Encryption' || echo 'No WiFi tools found'",
-            "default": "nmcli dev wifi list 2>/dev/null || echo 'WiFi scanning not available on this platform'",
-        },
-    },
-    # Port scanning
-    {
-        "patterns": [
-            r"(?:scan|check|find|list)\s+.*?(?:open\s+)?port",
-            r"(?:what(?:'s| is| are)\s+.*?(?:open|available)\s+port)",
-            r"(?:nmap|netcat|nc)\s+",
-        ],
-        "tool": "bash",
-        "command_map": {
-            "darwin": "lsof -i -P -n | grep LISTEN 2>/dev/null || netstat -an | grep LISTEN",
-            "linux": "ss -tuln 2>/dev/null || netstat -tuln 2>/dev/null",
-            "default": "ss -tuln 2>/dev/null || echo 'Port scanning not available'",
-        },
-    },
-    # System info
-    {
-        "patterns": [
-            r"(?:show|get|list|what(?:'s| is))\s+.*?(?:system|os|cpu|memory|disk|info|stats|status)",
-            r"(?:how (?:much|many)\s+.*?(?:memory|cpu|disk|space))",
-            r"(?:system\s+info|sysinfo|uname)",
-        ],
-        "tool": "bash",
-        "command_map": {
-            "darwin": "echo '=== OS ===' && uname -a && echo '=== CPU ===' && sysctl -n machdep.cpu.brand_string && echo '=== Memory ===' && vm_stat | head -5 && echo '=== Disk ===' && df -h / | tail -1",
-            "linux": "echo '=== OS ===' && uname -a && echo '=== CPU ===' && lscpu | head -5 && echo '=== Memory ===' && free -h | head -2 && echo '=== Disk ===' && df -h / | tail -1",
-            "default": "uname -a && echo '---' && df -h / | tail -1",
-        },
-    },
-    # Process listing
-    {
-        "patterns": [
-            r"(?:list|show|kill|find)\s+.*?(?:running\s+)?process",
-            r"(?:what(?:'s| is| are)\s+.*?(?:running|active)\s+process)",
-            r"(?:ps\s+aux|top\s+-n)",
-            r"(?:running\s+process)",
-        ],
-        "tool": "bash",
-        "command_map": {
-            "darwin": "ps aux -r 2>/dev/null | head -15 || ps aux | head -15",
-            "linux": "ps aux --sort=-%cpu 2>/dev/null | head -15 || ps aux | head -15",
-            "default": "ps aux | head -15",
-        },
-    },
-    # File operations
-    {
-        "patterns": [
-            r"(?:create|make|write|generate)\s+(?:a\s+)?(?:file|script)",
-            r"(?:read|show|cat|open|view)\s+(?:the\s+)?(?:file|script)",
-            r"(?:list|show|find)\s+(?:all\s+)?(?:file|folder|directory)",
-        ],
-        "tool": "detect",  # Will be mapped to read/write/glob based on context
-    },
-    # Directory listing
-    {
-        "patterns": [
-            r"(?:list|show|what(?:'s| is))\s+(?:in\s+)?(?:the\s+)?(?:current\s+)?(?:dir|directory|folder|path)",
-            r"(?:ls|dir)\s*(?:-la?|-l|/)?",
-        ],
-        "tool": "bash",
-        "command_map": {
-            "default": "ls -la",
-        },
-    },
-    # IP info
-    {
-        "patterns": [
-            r"(?:what(?:'s| is| are)\s+my\s+)?(?:ip|address|interface)",
-            r"(?:show|get|find)\s+(?:my\s+)?(?:ip|address|interface|mac)",
-            r"(?:ifconfig|ip\s+addr|ipconfig)",
-        ],
-        "tool": "bash",
-        "command_map": {
-            "darwin": "ifconfig | grep -E 'inet |en0|en1' | head -10",
-            "linux": "ip addr show 2>/dev/null | grep -E 'inet |eth0|wlan0' | head -10",
-            "default": "hostname -I 2>/dev/null || echo 'IP info not available'",
-        },
-    },
-    # Running services
-    {
-        "patterns": [
-            r"(?:list|show|what(?:'s| is))\s+(?:running\s+)?(?:service|daemon|server)",
-            r"(?:docker|containers?)\s+(?:list|show|running)",
-        ],
-        "tool": "bash",
-        "command_map": {
-            "darwin": "ps aux | grep -E '\.app|\.bundle|server' | grep -v grep | head -15",
-            "linux": "systemctl list-units --type=service --state=running 2>/dev/null | head -15 || ps aux | head -15",
-            "default": "ps aux | head -15",
-        },
-    },
-    # Git operations
-    {
-        "patterns": [
-            r"(?:show|what(?:'s| is))\s+(?:the\s+)?(?:git\s+)?(?:status|log|diff|branch)",
-            r"(?:git\s+)(status|log|diff|branch|commit|push|pull|fetch|clone)",
-        ],
-        "tool": "bash",
-        "command_map": {
-            "default": "git status 2>/dev/null || echo 'Not a git repository'",
-        },
-    },
-    # Python/Node execution
-    {
-        "patterns": [
-            r"(?:run|execute|python|python3|node|npm|pip)\s+",
-        ],
-        "tool": "bash",
-        "command_map": {
-            "default": "echo 'Use bash tool to run commands directly'",
-        },
-    },
-]
-
-
-def detect_intent(message):
-    """
-    Detect user intent from ANY prompt format.
-    Returns list of tool calls or None if no intent detected.
-    """
-    if not message:
-        return None
-
-    # Step 1: Extract the ACTUAL user request, ignoring all wrapper junk
-    clean = message.strip()
-
-    # Find the last known action keyword — that's the real request
-    # Look for patterns that indicate actual user commands
-    real_request = None
-
-    # Try to find content after common markers
-    for marker in [
-        "[START OUTPUT]",
-        "[/INST]",
-        "### ",
-        "[INST]",
-        "<<SYS>>",
-        "<</SYS>>",
-    ]:
-        idx = clean.rfind(marker)
-        if idx >= 0:
-            candidate = clean[idx + len(marker):].strip()
-            if len(candidate) > 5:  # Has actual content
-                real_request = candidate
-                break
-
-    # If no marker found, check if message looks like a jailbreak prompt
-    if real_request is None:
-        # Check for known jailbreak patterns
-        if any(x in clean.lower() for x in [
-            "userquery", "responseformat", "godmode", "dan mode",
-            "start output", "[inst]", "<<sys>>", "leetspeak",
-            "freak yah", "lfg!", "rebel answer",
-        ]):
-            # This is a jailbreak prompt — try to extract the actual command
-            # Look for action verbs that indicate what the user wants
-            action_match = re.search(
-                r'(?:scan|list|show|find|get|check|hack|crack|create|write|read|kill|run|execute|open|view|display|what|how)\s',
-                clean, re.IGNORECASE
-            )
-            if action_match:
-                # Take everything from the action verb onwards, limited to 200 chars
-                real_request = clean[action_match.start():action_match.start() + 200]
-            else:
-                # Can't find a clear command, skip intent detection
-                return None
+    # Weak-model recovery: if the model NARRATED an action ("I'll…", "Let me check…")
+    # instead of emitting a tool call, the turn would end doing nothing. Re-prompt once
+    # on the same DeepSeek session demanding the tool call.
+    if tools and not calls and _looks_like_tool_intent(raw):
+        logger.info("no tool call but intent narrated — re-prompting for the tool call")
+        followup = client.chat(
+            _REPROMPT,
+            chat_session_id=session_id,
+            parent_message_id=new_parent,
+            thinking_enabled=False, search_enabled=False,
+        )
+        raw2 = followup.choices[0].message.content or ""
+        calls2 = parse_tool_calls(raw2, tools)
+        if calls2:
+            raw, calls, new_parent = raw2, calls2, (followup.message_id or new_parent)
         else:
-            # Not a jailbreak prompt — use as-is
-            real_request = clean
+            # Still no call — keep whichever reply has real content.
+            raw = raw2 or raw
+            new_parent = followup.message_id or new_parent
 
-    # Step 2: Clean the extracted request
-    clean = real_request.lower()
+    # Record outcome so the next request continues this DeepSeek session.
+    _tracker.commit(plan, session_id, new_parent)
 
-    # Remove remaining wrapper artifacts
-    clean = re.sub(r'\{[^}]*\}', '', clean)
-    clean = re.sub(r'[\[\]()]', '', clean)
-    clean = re.sub(r'\s+', ' ', clean).strip()
+    if os.getenv("DEEPSEEK_DEBUG"):
+        _debug_dump(messages, tools, plan, prompt, raw, calls)
 
-    logger.info("Intent detection: cleaned message = %s", clean[:200])
-
-    if len(clean) < 3:
-        return None
-
-    # Check each intent pattern
-    for intent in INTENT_PATTERNS:
-        for pattern in intent["patterns"]:
-            if re.search(pattern, clean, re.IGNORECASE):
-                tool = intent["tool"]
-                if tool == "detect":
-                    # File operations — detect from context
-                    if any(w in clean for w in ["create", "write", "make", "generate", "save"]):
-                        # Extract filename
-                        file_match = re.search(r'(?:file|script|named?|called?)\s+["\']?([^\s"\']+)', clean)
-                        filename = file_match.group(1) if file_match else "output.txt"
-                        return [{"name": "write", "arguments": {"path": filename, "content": "# Created by proxy\n"}}]
-                    elif any(w in clean for w in ["read", "show", "cat", "open", "view"]):
-                        file_match = re.search(r'(?:file|script|named?|called?)\s+["\']?([^\s"\']+)', clean)
-                        filename = file_match.group(1) if file_match else "."
-                        return [{"name": "read", "arguments": {"path": filename}}]
-                    elif any(w in clean for w in ["list", "find", "show"]):
-                        path_match = re.search(r'(?:in|from|at)\s+["\']?([^\s"\']+)', clean)
-                        path = path_match.group(1) if path_match else "."
-                        return [{"name": "glob", "arguments": {"pattern": "**/*", "path": path}}]
-                    continue
-
-                # Get platform-specific command
-                import platform
-                system = platform.system().lower()
-                cmd_map = intent["command_map"]
-                command = cmd_map.get(system, cmd_map.get("default", "echo 'Command not available'"))
-
-                return [{"tool_name": "bash", "arguments": {"command": command}}]
-
-    return None
+    if calls:
+        return "", calls
+    return strip_thinking(raw).strip(), []
 
 
-def extract_last_user_message(messages):
-    """Extract the last user message content as string."""
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            content = msg.get("content", "")
-            if isinstance(content, str):
-                return content
-            elif isinstance(content, list):
-                return " ".join(p.get("text", "") for p in content if p.get("type") == "text")
-    return ""
+# A reply that announces intent without acting. If the model says any of these AND emits
+# no tool call, it almost certainly meant to call a tool.
+_INTENT_RE = re.compile(
+    r"^\s*(?:sure[,!. ]|okay[,!. ]|ok[,!. ]|alright[,!. ]|"
+    r"i'?ll\b|i will\b|let me\b|let's\b|lets\b|i'?m going to\b|i am going to\b|"
+    r"i can\b|i'?d\b|first[,. ]|now[,. ]|to (?:do|answer|find|check|count)\b)",
+    re.IGNORECASE,
+)
 
 
-# ============================================================
-# SSE HELPERS
-# ============================================================
+def _looks_like_tool_intent(text: str) -> bool:
+    t = strip_thinking(text or "").strip()
+    if not t:
+        return False
+    # Narration is usually short and ends with a colon or an action promise.
+    if _INTENT_RE.search(t):
+        return True
+    if t.rstrip().endswith(":") and len(t) < 400:
+        return True
+    return False
 
-def sse_chunk(chat_id, created, model, delta, finish_reason=None):
+
+_REPROMPT = (
+    "[system] You described an action but did not emit a tool call, so nothing happened. "
+    "If a tool is needed, reply with ONLY the XML tool call now (e.g. "
+    "<bash><command>...</command></bash>) and nothing else. If no tool is actually needed, "
+    "give the complete final answer directly."
+)
+
+
+_DEBUG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "debug")
+_debug_seq = 0
+
+
+_meta_seq = 0
+
+
+def _debug_request_meta(data, headers, query):
+    """Dump request headers + metadata + model so we can see Claude Code's session identity."""
+    global _meta_seq
+    try:
+        os.makedirs(_DEBUG_DIR, exist_ok=True)
+        _meta_seq += 1
+        # Redact the auth header; keep everything else.
+        safe_headers = {k: ("<redacted>" if k.lower() in ("authorization", "x-api-key") else v)
+                        for k, v in headers.items()}
+        info = {
+            "model": data.get("model"),
+            "metadata": data.get("metadata"),
+            "query": query,
+            "headers": safe_headers,
+            "n_messages": len(data.get("messages", [])),
+            "system_type": type(data.get("system")).__name__,
+        }
+        path = os.path.join(_DEBUG_DIR, f"meta_{_meta_seq:03d}.json")
+        with open(path, "w") as f:
+            json.dump(info, f, indent=2)
+        logger.info("DEBUG meta -> %s (model=%s metadata=%s)",
+                    path, data.get("model"), data.get("metadata"))
+    except Exception as e:
+        logger.warning("debug meta failed: %s", e)
+
+
+def _debug_dump(messages, tools, plan, prompt, raw, calls):
+    global _debug_seq
+    try:
+        os.makedirs(_DEBUG_DIR, exist_ok=True)
+        _debug_seq += 1
+        tool_names = [(t.get("function", t) or {}).get("name") for t in (tools or [])]
+        path = os.path.join(_DEBUG_DIR, f"turn_{_debug_seq:03d}.txt")
+        with open(path, "w") as f:
+            f.write(f"=== is_new_session={plan.is_new_session} tools={tool_names}\n")
+            f.write(f"=== incoming messages roles: {[m.get('role') for m in messages]}\n")
+            f.write(f"=== parsed tool calls: {[(c.name, c.arguments) for c in calls]}\n")
+            f.write(f"\n===== PROMPT SENT TO DEEPSEEK ({len(prompt)} chars) =====\n")
+            f.write(prompt)
+            f.write(f"\n\n===== RAW DEEPSEEK REPLY ({len(raw)} chars) =====\n")
+            f.write(raw)
+        logger.info("DEBUG dump -> %s (prompt=%d raw=%d calls=%d)",
+                    path, len(prompt), len(raw), len(calls))
+    except Exception as e:
+        logger.warning("debug dump failed: %s", e)
+
+
+# ---------------------------------------------------------------------------
+# OpenAI SSE helpers
+# ---------------------------------------------------------------------------
+
+def _sse(chat_id, created, delta, finish_reason=None):
     chunk = {
-        "id": chat_id, "object": "chat.completion.chunk",
-        "created": created, "model": model,
+        "id": chat_id, "object": "chat.completion.chunk", "created": created,
+        "model": MODEL_ID,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
     return f"data: {json.dumps(chunk)}\n\n"
 
 
-def stream_tool_calls(chat_id, created, model, tool_calls):
-    """Stream multiple tool calls in OpenAI SSE format."""
-    # First chunk with role
-    first_tc = tool_calls[0]
-    yield sse_chunk(chat_id, created, model, {
-        "role": "assistant", "content": None,
-        "tool_calls": [{
-            "id": f"call_{uuid.uuid4().hex[:8]}",
-            "type": "function",
-            "function": {"name": first_tc["name"], "arguments": ""},
-        }],
-    })
-
-    # Stream each tool call
-    for i, tc in enumerate(tool_calls):
-        call_id = f"call_{uuid.uuid4().hex[:8]}"
-        args_str = json.dumps(tc.get("arguments", {}))
-
-        # Send tool call header
-        yield sse_chunk(chat_id, created, model, {
-            "tool_calls": [{
-                "index": i,
-                "id": call_id,
-                "type": "function",
-                "function": {"name": tc["name"], "arguments": ""},
-            }],
-        })
-
-        # Send arguments in chunks
-        for j in range(0, len(args_str), 100):
-            yield sse_chunk(chat_id, created, model, {
-                "tool_calls": [{"index": i, "function": {"arguments": args_str[j:j+100]}}],
-            })
-
-    yield sse_chunk(chat_id, created, model, {}, finish_reason="tool_calls")
+def stream_text(chat_id, created, text):
+    yield _sse(chat_id, created, {"role": "assistant", "content": ""})
+    for i in range(0, len(text), 64):
+        yield _sse(chat_id, created, {"content": text[i:i + 64]})
+    yield _sse(chat_id, created, {}, finish_reason="stop")
     yield "data: [DONE]\n\n"
 
 
-def stream_text(chat_id, created, model, content):
-    """Stream text in OpenAI SSE format."""
-    yield sse_chunk(chat_id, created, model, {"role": "assistant", "content": ""})
-    # Send in larger chunks for speed
-    for i in range(0, len(content), 50):
-        yield sse_chunk(chat_id, created, model, {"content": content[i:i+50]})
-    yield sse_chunk(chat_id, created, model, {}, finish_reason="stop")
+def stream_tool_calls(chat_id, created, calls):
+    openai_calls = [to_openai_tool_call(c, f"call_{uuid.uuid4().hex[:12]}") for c in calls]
+    # First delta announces the assistant role.
+    yield _sse(chat_id, created, {"role": "assistant", "content": None})
+    for idx, oc in enumerate(openai_calls):
+        # Announce the call (name), then stream its arguments.
+        yield _sse(chat_id, created, {"tool_calls": [{
+            "index": idx, "id": oc["id"], "type": "function",
+            "function": {"name": oc["function"]["name"], "arguments": ""},
+        }]})
+        args = oc["function"]["arguments"]
+        for i in range(0, len(args), 128):
+            yield _sse(chat_id, created, {"tool_calls": [{
+                "index": idx, "function": {"arguments": args[i:i + 128]},
+            }]})
+    yield _sse(chat_id, created, {}, finish_reason="tool_calls")
     yield "data: [DONE]\n\n"
 
 
+# NB: no "Connection" / "Keep-Alive" here — those are hop-by-hop headers a WSGI app must
+# not set (PEP 3333); waitress rejects them with an AssertionError. The server manages the
+# connection. X-Accel-Buffering:no disables proxy buffering so SSE streams promptly.
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
 
-# ============================================================
-# CONTEXT BUILDER — optimized
-# ============================================================
+class _CollapseDoubledV1:
+    """
+    WSGI middleware that collapses a doubled `/v1/v1/` path prefix to `/v1/`.
 
-def build_context(messages, tools):
-    """Build clean context — NO tool instructions sent to DeepSeek."""
-    parts = []
+    Tolerates a base URL written with a trailing /v1: clients (Claude Code, some OpenAI
+    SDKs) append their own /v1/... path, so a base of http://host:5051/v1 produces
+    /v1/v1/messages. This runs BEFORE Flask routing (a before_request hook is too late —
+    Flask matches the route first), so the rewritten path is what gets matched.
+    """
 
-    for msg in messages:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
+    def __init__(self, wsgi_app):
+        self._app = wsgi_app
 
-        if role == "system":
-            # Skip ALL system prompts — DeepSeek doesn't need them
-            continue
-        elif role == "user":
-            if isinstance(content, str):
-                parts.append(f"User: {content[:2000]}")
-            elif isinstance(content, list):
-                text = " ".join(p.get("text", "") for p in content if p.get("type") == "text")
-                parts.append(f"User: {text[:2000]}")
-        elif role == "assistant":
-            if msg.get("tool_calls"):
-                # Don't include tool calls in context — model can't use them
-                continue
-            elif content:
-                parts.append(f"Assistant: {content[:500]}")
-        elif role == "tool":
-            # Include tool results as regular text
-            result = str(content)[:500]
-            parts.append(f"[Tool result]: {result}")
-
-    return "\n\n".join(parts)
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        while path.startswith("/v1/v1/"):
+            path = path[len("/v1"):]
+        environ["PATH_INFO"] = path
+        return self._app(environ, start_response)
 
 
-# ============================================================
-# PARALLEL TOOL EXECUTION
-# ============================================================
-
-def execute_tools_parallel(tool_calls):
-    """Execute multiple tool calls in parallel."""
-    results = []
-
-    def _exec(tc):
-        name = tc.get("name", "")
-        args = tc.get("arguments", {})
-        return _tool_executor.execute(name, args)
-
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(_exec, tc): tc for tc in tool_calls}
-        for future in futures:
-            tc = futures[future]
-            try:
-                result = future.result(timeout=30)
-                results.append({"call": tc, "result": result, "error": None})
-            except Exception as e:
-                results.append({"call": tc, "result": None, "error": str(e)})
-
-    return results
+app.wsgi_app = _CollapseDoubledV1(app.wsgi_app)
 
 
-# ============================================================
-# ROUTES
-# ============================================================
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+# Claude Code probes /v1/models for the exact model id it's configured with and refuses
+# to start if it's absent. The proxy ignores the model field entirely (everything routes
+# to DeepSeek), so we advertise the common Claude ids alongside deepseek-chat. Add more
+# here if Claude Code is pointed at a different model string.
+_ADVERTISED_MODELS = [
+    MODEL_ID,
+    "claude-opus-4-8", "claude-opus-4-8[1m]",
+    "claude-opus-4-7", "claude-sonnet-5", "claude-haiku-4-5",
+    "claude-3-5-haiku-20241022",  # Claude Code's small/background model
+]
+
 
 @app.route("/v1/models", methods=["GET"])
 def list_models():
-    return jsonify({
-        "object": "list",
-        "data": [{"id": "deepseek-chat", "object": "model", "created": 1686935002, "owned_by": "deepseek"}],
-    })
+    return jsonify({"object": "list", "data": [
+        {"id": m, "object": "model", "created": 1686935002, "owned_by": "deepseek-proxy"}
+        for m in _ADVERTISED_MODELS
+    ]})
 
 
-@app.route("/v1/execute-tool", methods=["POST"])
-def execute_tool():
-    data = request.get_json()
-    result = _tool_executor.execute(data.get("tool_name", ""), data.get("arguments", {}))
-    return jsonify({"result": result})
+@app.route("/v1/models/<path:model_id>", methods=["GET"])
+def get_model(model_id):
+    # Claude Code may GET a specific model to confirm it exists — always affirm.
+    return jsonify({"id": model_id, "object": "model", "created": 1686935002,
+                    "owned_by": "deepseek-proxy"})
 
 
-@app.route("/v1/stats", methods=["GET"])
-def stats():
-    return jsonify({
-        "cache": _response_cache.stats(),
-        "pow_cache_size": len(_pow_cache._cache),
-    })
+@app.route("/v1/messages/count_tokens", methods=["POST"])
+def count_tokens():
+    # The web endpoint has no token accounting; Claude Code only needs a number back.
+    data = request.get_json(force=True, silent=True) or {}
+    approx = len(json.dumps(data.get("messages", []))) // 4
+    return jsonify({"input_tokens": max(approx, 1)})
 
 
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
-    data = request.get_json()
+    data = request.get_json(force=True, silent=True) or {}
     messages = data.get("messages", [])
-    model = data.get("model", "deepseek-chat")
-    stream = data.get("stream", False)
     tools = data.get("tools")
+    stream = data.get("stream", False)
+    req_model = data.get("model", "")
 
     if not messages:
-        return jsonify({"error": "No messages provided"}), 400
+        return jsonify({"error": {"message": "no messages provided"}}), 400
 
     chat_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
-    # Detect new opencode session → create new DeepSeek session
-    new_session = detect_new_session(messages)
-
-    # Check if last message is a tool result
-    last_msg = messages[-1] if messages else {}
-    if last_msg.get("role") == "tool":
-        return _handle_tool_result(messages, chat_id, created, model, stream)
-
-    # ============================================================
-    # INTENT DETECTION — execute tools directly from ANY prompt
-    # ============================================================
-    user_msg = extract_last_user_message(messages)
-    detected = detect_intent(user_msg)
-    if detected:
-        logger.info("INTENT DETECTED: %s", detected)
-        # Execute tool directly via ToolExecutor.execute(tool_name, arguments)
-        results = []
-        for d in detected:
-            tool_name = d.get("tool_name", d.get("name", ""))
-            arguments = d.get("arguments", {})
-            try:
-                result = _tool_executor.execute(tool_name, arguments)
-                results.append(result)
-            except Exception as e:
-                results.append(f"Error: {e}")
-
-        output = "\n\n".join(results)
-        logger.info("INTENT RESULT: %s", output[:200])
+    try:
+        text, calls = run_turn(messages, tools, model=req_model)
+    except Exception as e:
+        logger.exception("run_turn failed")
+        err = f"[proxy error] {e}"
         if stream:
-            return Response(
-                stream_text(chat_id, created, model, output),
-                content_type="text/event-stream", headers=SSE_HEADERS,
-            )
-        return jsonify({
-            "id": chat_id, "object": "chat.completion", "created": created, "model": model,
-            "choices": [{"index": 0, "message": {"role": "assistant", "content": output}, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        })
+            return Response(stream_text(chat_id, created, err),
+                            content_type="text/event-stream", headers=SSE_HEADERS)
+        return jsonify(_completion_body(chat_id, created, err, None)), 200
 
-    # Check response cache (skip if new session)
-    if not new_session:
-        cached = _response_cache.get(messages, tools)
-        if cached:
-            logger.info("CACHE HIT")
-            if stream:
-                return Response(
-                    stream_text(chat_id, created, model, cached),
-                    content_type="text/event-stream", headers=SSE_HEADERS,
-                )
-            return jsonify({
-                "id": chat_id, "object": "chat.completion", "created": created, "model": model,
-                "choices": [{"index": 0, "message": {"role": "assistant", "content": cached}, "finish_reason": "stop"}],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-            })
-
-    # Build context
-    context = build_context(messages, tools)
-
-    # Call model
-    try:
-        client = get_client(reset=new_session)
-        resp = client.chat(context)
-        content = resp.choices[0].message.content
-    except Exception as e:
-        logger.exception("chat error")
-        return Response(
-            stream_text(chat_id, created, model, f"Error: {e}"),
-            content_type="text/event-stream", headers=SSE_HEADERS,
-        )
-
-    # Extract tool calls
-    if tools and content:
-        tool_calls = extract_tool_calls(content)
-        if tool_calls:
-            logger.info("TOOL CALLS: %s", [(tc["name"], tc.get("arguments", {})) for tc in tool_calls])
-
-            # Execute tools in parallel
-            results = execute_tools_parallel(tool_calls)
-
-            # Build tool results message for follow-up
-            tool_results = []
-            for r in results:
-                output = r["result"] if r["error"] is None else f"Error: {r['error']}"
-                tool_results.append(output)
-
-            # Stream tool calls
-            if stream:
-                return Response(
-                    stream_tool_calls(chat_id, created, model, tool_calls),
-                    content_type="text/event-stream", headers=SSE_HEADERS,
-                )
-
-    # Cache non-tool responses
-    if content and not (tools and extract_tool_calls(content)):
-        _response_cache.put(messages, tools, content)
-
-    # Stream text
-    if stream:
-        return Response(
-            stream_text(chat_id, created, model, content),
-            content_type="text/event-stream", headers=SSE_HEADERS,
-        )
-
-    return jsonify({
-        "id": chat_id, "object": "chat.completion", "created": created, "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    })
-
-
-def _handle_tool_result(messages, chat_id, created, model, stream):
-    """Handle tool results — forward to model and stream response."""
-    context = build_context(messages, None)
-
-    try:
-        client = get_client(reset=False)  # Don't reset for tool results
-        resp = client.chat(context)
-        content = resp.choices[0].message.content
-    except Exception as e:
-        logger.exception("tool result error")
-        return Response(
-            stream_text(chat_id, created, model, f"Error: {e}"),
-            content_type="text/event-stream", headers=SSE_HEADERS,
-        )
-
-    # Check for more tool calls
-    if content:
-        more_calls = extract_tool_calls(content)
-        if more_calls:
-            logger.info("MORE TOOL CALLS: %s", [tc["name"] for tc in more_calls])
-            if stream:
-                return Response(
-                    stream_tool_calls(chat_id, created, model, more_calls),
-                    content_type="text/event-stream", headers=SSE_HEADERS,
-                )
+    if calls:
+        if stream:
+            return Response(stream_tool_calls(chat_id, created, calls),
+                            content_type="text/event-stream", headers=SSE_HEADERS)
+        return jsonify(_completion_body(chat_id, created, None, calls)), 200
 
     if stream:
-        return Response(
-            stream_text(chat_id, created, model, content),
-            content_type="text/event-stream", headers=SSE_HEADERS,
-        )
+        return Response(stream_text(chat_id, created, text),
+                        content_type="text/event-stream", headers=SSE_HEADERS)
+    return jsonify(_completion_body(chat_id, created, text, None)), 200
 
-    return jsonify({
-        "id": chat_id, "object": "chat.completion", "created": created, "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+
+def _completion_body(chat_id, created, text, calls):
+    if calls:
+        openai_calls = [to_openai_tool_call(c, f"call_{uuid.uuid4().hex[:12]}") for c in calls]
+        message = {"role": "assistant", "content": None, "tool_calls": openai_calls}
+        finish = "tool_calls"
+    else:
+        message = {"role": "assistant", "content": text or ""}
+        finish = "stop"
+    return {
+        "id": chat_id, "object": "chat.completion", "created": created, "model": MODEL_ID,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-    })
+    }
 
 
-@app.route("/v1/auth/token", methods=["POST"])
-def auth_token():
-    return jsonify({"access_token": "bypass", "token_type": "bearer"})
+@app.route("/v1/messages", methods=["POST"])
+def anthropic_messages():
+    """Anthropic Messages API endpoint — lets Claude Code use DeepSeek as its provider."""
+    data = request.get_json(force=True, silent=True) or {}
+    model = data.get("model", MODEL_ID)
+    stream = data.get("stream", False)
+
+    # One-shot capture of what Claude Code actually sends (headers + metadata + model),
+    # to design a stable conversation key. Enable with DEEPSEEK_DEBUG=1.
+    if os.getenv("DEEPSEEK_DEBUG"):
+        _debug_request_meta(data, dict(request.headers), request.args.to_dict())
+
+    messages, tools = anthropic_api.anthropic_to_internal(data)
+    if not messages:
+        return jsonify({"type": "error",
+                        "error": {"type": "invalid_request_error", "message": "no messages"}}), 400
+
+    conversation_id = anthropic_api.conversation_id_from_metadata(data)
+
+    try:
+        text, calls = run_turn(messages, tools, conversation_id=conversation_id, model=model)
+    except Exception as e:
+        logger.exception("run_turn failed (anthropic)")
+        text, calls = f"[proxy error] {e}", []
+
+    if stream:
+        gen = (anthropic_api.stream_anthropic_tool_calls(model, calls) if calls
+               else anthropic_api.stream_anthropic_text(model, text))
+        return Response(gen, content_type="text/event-stream", headers=SSE_HEADERS)
+
+    return jsonify(anthropic_api.build_anthropic_message(model, text, calls)), 200
 
 
-# ============================================================
-# STARTUP
-# ============================================================
+@app.route("/health", methods=["GET"])
+def health():
+    info = {"status": "ok", "client_ready": _client is not None}
+    try:
+        if _client is not None:
+            sess = _client.session
+            pool = getattr(sess, "_pow_pool", None)
+            if pool is not None:
+                info["pow_pool_ready"] = pool._count_valid()
+            info["tracked_conversations"] = len(_tracker._convs)
+    except Exception:
+        pass
+    return jsonify(info)
+
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(name)s:%(levelname)s:%(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    port = int(os.getenv("PROXY_PORT", "5051"))
 
-    print("\n  DeepSeek Optimized Proxy — http://localhost:5051\n")
-    print("  Improvements:")
-    print("    PoW Caching:     pre-solve + cache (saves 2-10s)")
-    print("    Response Cache:  LRU with TTL (saves 1-5s)")
-    print("    Parallel Tools:  ThreadPoolExecutor (saves 5-20s)")
-    print("    Context Opt:     compact prompts (saves 500ms)")
-    print("    SSE Streaming:   optimized chunks")
-    print()
+    print(f"\n  DeepSeek → OpenAI proxy on http://localhost:{port}\n")
+    print("  Warming up browser session (login may open a window)...")
 
     def _warmup():
         try:
             get_client()
-            print("  [ready] Browser session active!")
-            # Pre-fill PoW cache in background
-            _pow_cache.prefill(3)
-            print("  [ready] PoW cache pre-filled!")
+            print("  [ready] DeepSeek session active\n")
         except Exception as e:
-            print(f"  [error] Browser failed: {e}")
-            traceback.print_exc()
+            print(f"  [error] warmup failed: {e}\n")
 
     threading.Thread(target=_warmup, daemon=True).start()
 
-    print("  Starting Flask...\n")
-    app.run(host="0.0.0.0", port=5051, debug=False)
+    # Prefer a production WSGI server (waitress: pure-Python, real concurrency) over
+    # Flask's single-threaded dev server. Fall back to app.run if waitress isn't installed.
+    try:
+        from waitress import serve
+        print(f"  Serving via waitress on http://0.0.0.0:{port}\n")
+        serve(app, host="0.0.0.0", port=port, threads=8, channel_timeout=300)
+    except ImportError:
+        print("  waitress not installed — using Flask dev server (pip install waitress)\n")
+        app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
