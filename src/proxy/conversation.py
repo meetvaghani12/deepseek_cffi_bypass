@@ -58,6 +58,16 @@ def _turn_signature(msg: Message) -> str:
         payload = f"{msg.get('tool_call_id', '')}:{_msg_text(msg)}"
     else:
         payload = _msg_text(msg)
+    # Fold in a light attachment fingerprint (count + media type + short data hash) so a
+    # turn carrying an image/PDF is distinct from the same text without it — without
+    # hashing the whole (large) base64 payload.
+    atts = msg.get("attachments")
+    if atts:
+        parts = []
+        for a in atts:
+            d = a.get("data", "")
+            parts.append(f"{a.get('media_type','')}:{len(d)}:{d[:32]}")
+        payload += "\x00ATT\x00" + "|".join(parts)
     h = hashlib.sha1(f"{role}\x00{payload}".encode("utf-8", "replace")).hexdigest()[:16]
     return f"{role}:{h}"
 

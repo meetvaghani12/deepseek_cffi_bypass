@@ -84,6 +84,40 @@ def conversation_id_from_metadata(data: Dict[str, Any]) -> str:
     return uid
 
 
+def _extract_attachments(content: Any) -> List[Dict[str, Any]]:
+    """
+    Pull base64 image and document (PDF) blocks out of Anthropic content.
+
+    Anthropic shapes:
+      {"type":"image","source":{"type":"base64","media_type":"image/png","data":"..."}}
+      {"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"..."}}
+    Returns [{kind:"image"|"document", media_type, data(b64), filename}]. URL/file-id
+    sources are skipped (we can only upload bytes we actually have).
+    """
+    if not isinstance(content, list):
+        return []
+    out = []
+    ext = {"image/png": "png", "image/jpeg": "jpg", "image/jpg": "jpg",
+           "image/webp": "webp", "image/gif": "gif", "application/pdf": "pdf"}
+    for b in content:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t not in ("image", "document"):
+            continue
+        src = b.get("source") or {}
+        if src.get("type") != "base64" or not src.get("data"):
+            continue  # only base64 payloads are uploadable here
+        mt = src.get("media_type", "application/octet-stream")
+        out.append({
+            "kind": "image" if t == "image" else "document",
+            "media_type": mt,
+            "data": src["data"],
+            "filename": f"upload_{len(out)}.{ext.get(mt, 'bin')}",
+        })
+    return out
+
+
 def anthropic_to_internal(data: Dict[str, Any]) -> Tuple[List[Dict], List[Dict]]:
     """
     Convert an Anthropic /v1/messages request body into (messages, tools) in the
@@ -102,12 +136,16 @@ def anthropic_to_internal(data: Dict[str, Any]) -> Tuple[List[Dict], List[Dict]]
         content = msg.get("content")
 
         if role == "user":
-            # A user turn may carry tool_result blocks (Anthropic puts them here).
+            # A user turn may carry tool_result blocks and/or image/document blocks.
             if isinstance(content, list):
                 tool_results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"]
+                attachments = _extract_attachments(content)
                 text = _text_from_anthropic_content(content)
-                if text:
-                    messages.append({"role": "user", "content": text})
+                if text or attachments:
+                    m = {"role": "user", "content": text}
+                    if attachments:
+                        m["attachments"] = attachments  # [{kind,media_type,data,filename}]
+                    messages.append(m)
                 for tr in tool_results:
                     messages.append({
                         "role": "tool",

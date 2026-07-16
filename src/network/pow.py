@@ -59,17 +59,18 @@ def capture_auth_token(page, context) -> str:
     return auth_token[0]
 
 
-def get_pow_via_browser(page, auth_token: str) -> str:
+def get_pow_via_browser(page, auth_token: str, target_path: str = "/api/v0/chat/completion") -> str:
     """
-    Get a fresh PoW challenge and solve it using the browser's WASM Worker.
-    Returns the base64-encoded solution.
+    Get a fresh PoW challenge for `target_path` and solve it via the browser's WASM Worker.
+    Returns the base64-encoded solution. The challenge is bound to the target_path, so
+    uploads (/api/v0/file/upload_file) need a distinct challenge from chat completions.
     """
     result = page.evaluate('''
-    async (authToken) => {
+    async ([authToken, targetPath]) => {
         const chResp = await fetch('/api/v0/chat/create_pow_challenge', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'Authorization': authToken },
-            body: JSON.stringify({ target_path: '/api/v0/chat/completion' })
+            body: JSON.stringify({ target_path: targetPath })
         });
         const chData = await chResp.json();
         if (!chData.data) return { error: JSON.stringify(chData).substring(0, 300) };
@@ -112,7 +113,7 @@ def get_pow_via_browser(page, auth_token: str) -> str:
 
         return btoa(JSON.stringify(solution));
     }
-    ''', auth_token)
+    ''', [auth_token, target_path])
 
     if isinstance(result, dict) and 'error' in result:
         raise Exception(f"PoW solve failed: {result}")

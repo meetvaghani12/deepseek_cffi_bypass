@@ -40,6 +40,9 @@ class DeepSeekClient:
         parent_message_id: Optional[str] = None,
         thinking_enabled: bool = False,
         search_enabled: bool = False,
+        ref_file_ids: Optional[list] = None,
+        model_type: str = "default",
+        extra_headers: Optional[dict] = None,
         **kwargs,
     ) -> ChatResponse:
         # Resolve the session id: explicit arg > instance state > create new.
@@ -51,12 +54,16 @@ class DeepSeekClient:
         # is expressed by passing chat_session_id with parent_message_id omitted).
         parent_id = parent_message_id if parent_message_id is not None else self._parent_message_id
 
+        # Files require search OFF (DeepSeek rejects file refs with search on).
+        if ref_file_ids:
+            search_enabled = False
+
         payload = {
             "chat_session_id": session_id,
             "parent_message_id": parent_id,
-            "model_type": "default",
+            "model_type": model_type,
             "prompt": message,
-            "ref_file_ids": [],
+            "ref_file_ids": ref_file_ids or [],
             "thinking_enabled": thinking_enabled,
             "search_enabled": search_enabled,
             "action": None,
@@ -64,11 +71,15 @@ class DeepSeekClient:
         }
         payload.update(kwargs)
 
-        logger.info("chat request (session=%s parent=%s len=%d)", session_id, parent_id, len(message))
+        logger.info("chat request (session=%s parent=%s len=%d model=%s files=%d)",
+                    session_id, parent_id, len(message), model_type, len(ref_file_ids or []))
 
+        post_kwargs = {"json": payload}
+        if extra_headers:
+            post_kwargs["headers"] = extra_headers  # e.g. x-hif-leim/x-hif-dliq for vision
         resp = self.session.post(
             "https://chat.deepseek.com/api/v0/chat/completion",
-            json=payload,
+            **post_kwargs,
         )
 
         if resp.status_code != 200:

@@ -120,13 +120,136 @@ class BrowserSession:
         ''', token)
         return session_id
 
-    def solve_pow(self) -> str:
+    def solve_pow(self, target_path: str = "/api/v0/chat/completion") -> str:
         from src.network.pow import get_pow_via_browser
-        return get_pow_via_browser(self._page, self.get_auth_token())
+        return get_pow_via_browser(self._page, self.get_auth_token(), target_path)
 
     def intercept_pow(self) -> dict:
         from src.network.pow import get_pow_via_cdp_intercept
         return get_pow_via_cdp_intercept(self._page, self._context)
+
+    def upload_image(self, b64_data: str, media_type: str = "image/png",
+                     filename: str = "image.png", vision: bool = True,
+                     timeout_ms: int = 60000) -> dict:
+        """
+        Upload one image/file to chat.deepseek.com and return the ref_file_id to attach.
+
+        Runs entirely inside the browser page: the page's own `fetch` handles multipart
+        upload, the PoW challenge (target_path /api/v0/file/upload_file), the vision fork,
+        and status polling — sidestepping curl_cffi's lack of multipart support. Returns
+        {"file_id": <id>, "vision": bool, "status": "SUCCESS"} or {"error": "..."}.
+        """
+        token = self._user_token
+        result = self._page.evaluate('''
+        async ([token, b64, mediaType, filename, wantVision, timeoutMs]) => {
+          const log = [];
+          try {
+            // --- helper: solve a PoW for a given target_path via the WASM Worker ---
+            async function solvePow(targetPath) {
+              const chResp = await fetch('/api/v0/chat/create_pow_challenge', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', 'Authorization': token },
+                body: JSON.stringify({ target_path: targetPath })
+              });
+              const chData = await chResp.json();
+              if (!chData.data) throw new Error('pow challenge: ' + JSON.stringify(chData).slice(0,200));
+              const raw = chData.data.biz_data.challenge;
+              const ch = { algorithm: raw.algorithm, challenge: raw.challenge, salt: raw.salt,
+                           difficulty: raw.difficulty, signature: raw.signature, expireAt: raw.expire_at };
+              const answer = await new Promise((resolve, reject) => {
+                const w = new Worker('https://fe-static.deepseek.com/chat/static/37627.ebf6d8f55d.js');
+                let attempts = 0;
+                const tryS = () => { attempts++; w.postMessage({ type: 'pow-challenge', challenge: ch }); };
+                const to = setTimeout(() => { w.terminate(); reject(new Error('pow timeout')); }, 15000);
+                w.onmessage = (e) => {
+                  if (e.data.type === 'pow-answer') { clearTimeout(to); w.terminate(); resolve(e.data.answer); }
+                  else if (e.data.type === 'pow-error') {
+                    if (attempts < 10) setTimeout(tryS, 1000);
+                    else { clearTimeout(to); w.terminate(); reject(new Error('pow-error')); }
+                  }
+                };
+                w.onerror = (e) => { clearTimeout(to); w.terminate(); reject(new Error('worker: ' + e.message)); };
+                setTimeout(tryS, 2000);
+              });
+              return btoa(JSON.stringify(answer));
+            }
+
+            // --- 1. base64 -> Blob ---
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const blob = new Blob([bytes], { type: mediaType });
+
+            // --- 2. upload (multipart, field "file") with upload PoW ---
+            const uploadPow = await solvePow('/api/v0/file/upload_file');
+            const fd = new FormData();
+            fd.append('file', blob, filename);
+            const upResp = await fetch('/api/v0/file/upload_file', {
+              method: 'POST',
+              headers: { 'Authorization': token, 'x-ds-pow-response': uploadPow },
+              body: fd
+            });
+            const upData = await upResp.json();
+            if (!upData.data || !upData.data.biz_data) throw new Error('upload: ' + JSON.stringify(upData).slice(0,200));
+            let fileId = upData.data.biz_data.id;
+            log.push('uploaded ' + fileId);
+
+            // --- 3. fork to vision (for true image understanding) ---
+            let isVision = false;
+            if (wantVision) {
+              try {
+                const forkResp = await fetch('/api/v0/file/fork_file_task', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json', 'Authorization': token },
+                  body: JSON.stringify({ file_id: fileId, to_model_type: 'vision' })
+                });
+                const forkData = await forkResp.json();
+                if (forkData.data && forkData.data.biz_data && forkData.data.biz_data.id) {
+                  fileId = forkData.data.biz_data.id; isVision = true; log.push('forked ' + fileId);
+                }
+              } catch (e) { log.push('fork failed: ' + e.message); }
+            }
+
+            // --- 4. poll fetch_files until SUCCESS ---
+            const deadline = Date.now() + timeoutMs;
+            const PENDING = ['PENDING','PARSING','UPLOADING','QUEUED'];
+            while (Date.now() < deadline) {
+              const fResp = await fetch('/api/v0/file/fetch_files?file_ids=' + encodeURIComponent(fileId), {
+                method: 'GET', headers: { 'Authorization': token }
+              });
+              const fData = await fResp.json();
+              const files = fData.data && fData.data.biz_data && fData.data.biz_data.files;
+              const st = files && files[0] && files[0].status;
+              if (st === 'SUCCESS') return { file_id: fileId, vision: isVision, status: 'SUCCESS', log };
+              if (st && !PENDING.includes(st)) return { error: 'file status ' + st, log };
+              await new Promise(r => setTimeout(r, 1500));
+            }
+            return { error: 'file parse timeout', log };
+          } catch (e) {
+            return { error: String(e && e.message || e), log };
+          }
+        }
+        ''', [token, b64_data, media_type, filename, vision, timeout_ms])
+        return result
+
+    def get_hif_headers(self) -> dict:
+        """Fetch the x-hif-leim / x-hif-dliq signed headers required for vision completions."""
+        token = self._user_token
+        return self._page.evaluate('''
+        async (token) => {
+          const out = {};
+          try {
+            const opts = { method: 'GET', headers: { 'Authorization': token } };
+            const [a, b] = await Promise.all([
+              fetch('https://hif-leim.deepseek.com/query', opts).then(r => r.text()).catch(() => ''),
+              fetch('https://hif-dliq.deepseek.com/query', opts).then(r => r.text()).catch(() => ''),
+            ]);
+            if (a) out['x-hif-leim'] = a.trim();
+            if (b) out['x-hif-dliq'] = b.trim();
+          } catch (e) {}
+          return out;
+        }
+        ''', token)
 
     def get_page(self):
         return self._page
@@ -294,6 +417,17 @@ class PersistentSession:
 
     def create_session(self) -> str:
         return self._run(self.browser_session.create_session)
+
+    def upload_image(self, b64_data: str, media_type: str = "image/png",
+                     filename: str = "image.png", vision: bool = True) -> Dict:
+        """Upload one image/file (runs on the browser thread, under the chat lock so it
+        doesn't race PoW solves). Returns {file_id, vision, status} or {error}."""
+        with self._chat_lock:
+            return self._run(self.browser_session.upload_image,
+                             b64_data, media_type, filename, vision)
+
+    def get_hif_headers(self) -> Dict:
+        return self._run(self.browser_session.get_hif_headers)
 
     def _get_headers(self, auth_token: str = None, pow_response: str = None) -> Dict:
         from src.anti_detection.headers import build_headers

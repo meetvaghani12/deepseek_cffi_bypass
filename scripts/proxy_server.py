@@ -116,12 +116,19 @@ def run_turn(messages, tools, conversation_id=None, model=""):
         session_id = plan.prior_session_id
         parent_id = plan.prior_parent_id
 
+    # Upload any image/PDF attachments on the new turns and collect ref_file_ids.
+    # Images fork to the vision model; PDFs/docs use OCR text extraction.
+    ref_file_ids, model_type, extra_headers = _handle_attachments(client, plan.new_turns)
+
     resp = client.chat(
         prompt,
         chat_session_id=session_id,
         parent_message_id=parent_id,
         thinking_enabled=False,
         search_enabled=False,
+        ref_file_ids=ref_file_ids or None,
+        model_type=model_type,
+        extra_headers=extra_headers or None,
     )
     raw = resp.choices[0].message.content or ""
     new_parent = resp.message_id if resp.id != "error" else None
@@ -188,6 +195,52 @@ _REPROMPT = (
 )
 
 
+def _handle_attachments(client, new_turns):
+    """
+    Upload any image/document attachments on the new turns to DeepSeek and return
+    (ref_file_ids, model_type, extra_headers). Images fork to the vision model (model_type
+    'vision' + HIF headers); documents use OCR text extraction (normal model_type).
+    Upload failures are logged and skipped — the turn still proceeds text-only.
+    """
+    attachments = []
+    for m in new_turns:
+        for att in (m.get("attachments") or []):
+            attachments.append(att)
+    if not attachments:
+        return [], "default", {}
+
+    ref_ids, any_vision = [], False
+    for att in attachments:
+        is_image = att.get("kind") == "image"
+        try:
+            result = client.session.upload_image(
+                att["data"], media_type=att.get("media_type", "image/png"),
+                filename=att.get("filename", "upload.bin"), vision=is_image,
+            )
+        except Exception as e:
+            logger.warning("attachment upload raised: %s", e)
+            continue
+        if not isinstance(result, dict) or result.get("error"):
+            logger.warning("attachment upload failed: %s", (result or {}).get("error"))
+            continue
+        ref_ids.append(result["file_id"])
+        if result.get("vision"):
+            any_vision = True
+        logger.info("attachment uploaded: %s (vision=%s)", result["file_id"], result.get("vision"))
+
+    if not ref_ids:
+        return [], "default", {}
+
+    model_type = "vision" if any_vision else "default"
+    extra_headers = {}
+    if any_vision:
+        try:
+            extra_headers = client.session.get_hif_headers() or {}
+        except Exception as e:
+            logger.warning("HIF header fetch failed: %s", e)
+    return ref_ids, model_type, extra_headers
+
+
 _DEBUG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "debug")
 _debug_seq = 0
 
@@ -204,6 +257,21 @@ def _debug_request_meta(data, headers, query):
         # Redact the auth header; keep everything else.
         safe_headers = {k: ("<redacted>" if k.lower() in ("authorization", "x-api-key") else v)
                         for k, v in headers.items()}
+        # Detect image content blocks so we can see exactly how Claude Code encodes them.
+        image_blocks = []
+        for m in data.get("messages", []):
+            c = m.get("content")
+            if isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict) and b.get("type") == "image":
+                        src = b.get("source", {}) or {}
+                        image_blocks.append({
+                            "source_type": src.get("type"),           # base64 | url | file
+                            "media_type": src.get("media_type"),
+                            "data_len": len(src.get("data", "")) if src.get("data") else 0,
+                            "url": src.get("url"),
+                            "file_id": src.get("file_id"),
+                        })
         info = {
             "model": data.get("model"),
             "metadata": data.get("metadata"),
@@ -211,7 +279,11 @@ def _debug_request_meta(data, headers, query):
             "headers": safe_headers,
             "n_messages": len(data.get("messages", [])),
             "system_type": type(data.get("system")).__name__,
+            "image_blocks": image_blocks,
         }
+        if image_blocks:
+            logger.info("IMAGE request: %d image block(s) %s",
+                        len(image_blocks), [(b["source_type"], b["media_type"]) for b in image_blocks])
         path = os.path.join(_DEBUG_DIR, f"meta_{_meta_seq:03d}.json")
         with open(path, "w") as f:
             json.dump(info, f, indent=2)
